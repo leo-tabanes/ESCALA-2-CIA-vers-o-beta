@@ -137,6 +137,38 @@ function substituicaoParaBanco(s) {
   return { id: s.id, titular_id: s.titularId, substituto_id: s.substitutoId, equipe_id: s.equipeId, data_iso: s.dataISO };
 }
 
+// --- Mapeamento horário padrão por lotação + dia da semana ---
+function horarioLotacaoDoBanco(row) {
+  return {
+    equipeId: row.equipe_id, diaSemana: row.dia_semana,
+    horaInicioDia: row.hora_inicio_dia, horaFimDia: row.hora_fim_dia,
+    horaInicioNoite: row.hora_inicio_noite, horaFimNoite: row.hora_fim_noite,
+  };
+}
+function horarioLotacaoParaBanco(h) {
+  return {
+    equipe_id: h.equipeId, dia_semana: h.diaSemana,
+    hora_inicio_dia: h.horaInicioDia || null, hora_fim_dia: h.horaFimDia || null,
+    hora_inicio_noite: h.horaInicioNoite || null, hora_fim_noite: h.horaFimNoite || null,
+  };
+}
+
+// --- Mapeamento exceção pontual de horário (sobrescreve 1 dia específico) ---
+function horarioExcecaoDoBanco(row) {
+  return {
+    id: row.id, equipeId: row.equipe_id, dataISO: row.data_iso,
+    horaInicioDia: row.hora_inicio_dia, horaFimDia: row.hora_fim_dia,
+    horaInicioNoite: row.hora_inicio_noite, horaFimNoite: row.hora_fim_noite,
+  };
+}
+function horarioExcecaoParaBanco(h) {
+  return {
+    id: h.id, equipe_id: h.equipeId, data_iso: h.dataISO,
+    hora_inicio_dia: h.horaInicioDia || null, hora_fim_dia: h.horaFimDia || null,
+    hora_inicio_noite: h.horaInicioNoite || null, hora_fim_noite: h.horaFimNoite || null,
+  };
+}
+
 // --- API genérica de leitura/escrita por tabela ---
 async function dbListar(tabela, mapeador) {
   const { data, error } = await db.from(tabela).select("*");
@@ -185,11 +217,23 @@ function statusServico2x2(dataISO, ancoraISO, offset = 0) {
   const pos = ((dias % 4) + 4) % 4;
   return pos === 0 || pos === 1 ? "SERVICO" : "FOLGA";
 }
-function horarioCGP(dow) { return (dow === 5 || dow === 6) ? "14h30 – 03h00" : "12h30 – 01h00"; }
-function horarioTurno12x24(turno) {
-  if (turno === "DIA") return "07h00 – 19h00";
-  if (turno === "NOITE") return "19h00 – 07h00";
-  return "";
+// Resolve o horário de uma lotação num dia específico, considerando:
+// 1) exceção pontual cadastrada pra aquela data (prioridade máxima)
+// 2) horário padrão configurado pra aquele dia da semana
+// 3) fallback embutido, caso nada tenha sido configurado ainda
+function resolverHorarioLotacao(equipeId, dataISO, horariosLotacao, horariosExcecao) {
+  const excecao = (horariosExcecao || []).find((h) => h.equipeId === equipeId && h.dataISO === dataISO);
+  if (excecao) return excecao;
+  const dow = diaDaSemana(dataISO);
+  const padrao = (horariosLotacao || []).find((h) => h.equipeId === equipeId && h.diaSemana === dow);
+  if (padrao) return padrao;
+  // Fallback: ninguém configurou ainda para este dia da semana.
+  return { horaInicioDia: "07h00", horaFimDia: "19h00", horaInicioNoite: "19h00", horaFimNoite: "07h00" };
+}
+
+function formatarTurnoLabel(horaInicio, horaFim) {
+  if (!horaInicio || !horaFim) return "Horário não configurado";
+  return `${horaInicio} – ${horaFim}`;
 }
 
 // Retorna o afastamento vigente (se houver) de um policial numa data específica.
@@ -205,7 +249,7 @@ function afastamentoNoDia(afastamentos, policialId, dataISO) {
    GERAÇÃO AUTOMÁTICA DA ESCALA
    ============================================================ */
 
-function gerarEscalaAutomatica(policiais, equipeId, ano, mes, configuracoesLotacao) {
+function gerarEscalaAutomatica(policiais, equipeId, ano, mes, configuracoesLotacao, horariosLotacao, horariosExcecao) {
   const equipe = EQUIPES.find((e) => e.id === equipeId);
   const dias = diasDoMes(ano, mes);
   const membros = policiais.filter((p) => p.equipeId === equipeId && p.ativo !== false);
@@ -219,7 +263,12 @@ function gerarEscalaAutomatica(policiais, equipeId, ano, mes, configuracoesLotac
       const grupo = GRUPOS_REVEZAMENTO.find((g) => g.id === p.grupoRevezamento) || GRUPOS_REVEZAMENTO[0];
       dias.forEach((iso) => {
         const status = statusEquipe12x24(iso, ancoraLotacao, grupo.offset);
-        resultado[iso].push({ policialId: p.id, status, turnoLabel: status === "FOLGA" ? "Folga" : horarioTurno12x24(status) });
+        let turnoLabel = "Folga";
+        if (status !== "FOLGA") {
+          const horario = resolverHorarioLotacao(equipeId, iso, horariosLotacao, horariosExcecao);
+          turnoLabel = status === "DIA" ? formatarTurnoLabel(horario.horaInicioDia, horario.horaFimDia) : formatarTurnoLabel(horario.horaInicioNoite, horario.horaFimNoite);
+        }
+        resultado[iso].push({ policialId: p.id, status, turnoLabel });
       });
     });
   } else if (equipe.tipo === "2x2") {
@@ -228,15 +277,20 @@ function gerarEscalaAutomatica(policiais, equipeId, ano, mes, configuracoesLotac
       const offset = p.offsetCiclo || 0;
       dias.forEach((iso) => {
         const status = statusServico2x2(iso, ancora, offset);
-        resultado[iso].push({ policialId: p.id, status: status === "SERVICO" ? "SERVICO" : "FOLGA", turnoLabel: status === "SERVICO" ? "Serviço" : "Folga" });
+        let turnoLabel = "Folga";
+        if (status === "SERVICO") {
+          const horario = resolverHorarioLotacao(equipeId, iso, horariosLotacao, horariosExcecao);
+          turnoLabel = formatarTurnoLabel(horario.horaInicioDia, horario.horaFimDia);
+        }
+        resultado[iso].push({ policialId: p.id, status: status === "SERVICO" ? "SERVICO" : "FOLGA", turnoLabel });
       });
     });
   } else if (equipe.tipo === "2x2-cgp") {
     const sargenteados = membros.filter((p) => GRADUACOES_SARGENTEADAS.includes(p.posto));
     const pracas = membros.filter((p) => !GRADUACOES_SARGENTEADAS.includes(p.posto));
     dias.forEach((iso) => {
-      const dow = diaDaSemana(iso);
-      const turnoServico = horarioCGP(dow);
+      const horario = resolverHorarioLotacao(equipeId, iso, horariosLotacao, horariosExcecao);
+      const turnoServico = formatarTurnoLabel(horario.horaInicioDia, horario.horaFimDia);
       [...sargenteados.map((p) => ({ p, funcao: "Comandante de Equipe" })), ...pracas.map((p) => ({ p, funcao: "Patrulheiro" }))].forEach(({ p, funcao }) => {
         const ancora = p.dataAncora || "2026-01-01";
         const offset = p.offsetCiclo || 0;
@@ -295,7 +349,7 @@ function TelaLogin({ onLogin, onVisitante, onConsultaRE, escalantes }) {
    CONSULTA POR RE
    ============================================================ */
 
-function TelaConsultaRE({ policiais, afastamentos, reforcos, configuracoesLotacao, substituicoes, onVoltar }) {
+function TelaConsultaRE({ policiais, afastamentos, reforcos, configuracoesLotacao, substituicoes, horariosLotacao, horariosExcecao, onVoltar }) {
   const [re, setRe] = useState("");
   const [resultado, setResultado] = useState(null);
   const [erro, setErro] = useState("");
@@ -316,7 +370,7 @@ function TelaConsultaRE({ policiais, afastamentos, reforcos, configuracoesLotaca
 
   const equipe = resultado ? EQUIPES.find((e) => e.id === resultado.equipeId) : null;
   const dias = diasDoMes(dataRef.ano, dataRef.mes);
-  const escalaBase = useMemo(() => resultado ? gerarEscalaAutomatica(policiais, resultado.equipeId, dataRef.ano, dataRef.mes, configuracoesLotacao) : {}, [policiais, resultado, dataRef, configuracoesLotacao]);
+  const escalaBase = useMemo(() => resultado ? gerarEscalaAutomatica(policiais, resultado.equipeId, dataRef.ano, dataRef.mes, configuracoesLotacao, horariosLotacao, horariosExcecao) : {}, [policiais, resultado, dataRef, configuracoesLotacao, horariosLotacao, horariosExcecao]);
 
   const statusDoDia = useCallback((iso) => {
     if (!resultado) return null;
@@ -406,6 +460,8 @@ function App() {
   const [reforcos, setReforcos] = useState([]); // { id, policialId, dataISO, equipeId }
   const [configuracoesLotacao, setConfiguracoesLotacao] = useState([]); // { equipeId, dataAncora }
   const [substituicoes, setSubstituicoes] = useState([]); // { id, titularId, substitutoId, equipeId, dataISO }
+  const [horariosLotacao, setHorariosLotacao] = useState([]); // { equipeId, diaSemana, horaInicioDia, horaFimDia, horaInicioNoite, horaFimNoite }
+  const [horariosExcecao, setHorariosExcecao] = useState([]); // { id, equipeId, dataISO, ... }
   const [equipeAtiva, setEquipeAtiva] = useState(EQUIPES[0].id);
   const [dataRef, setDataRef] = useState(() => { const h = new Date(); return { ano: h.getFullYear(), mes: h.getMonth() }; });
   const [abaPrincipal, setAbaPrincipal] = useState("escala");
@@ -418,13 +474,15 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [pol, esc, afa, ref, cfg, sub] = await Promise.all([
+        const [pol, esc, afa, ref, cfg, sub, horLot, horExc] = await Promise.all([
           dbListar("policiais", policialDoBanco),
           dbListar("escalantes", (row) => ({ usuario: row.usuario, senha: row.senha, nome: row.nome })),
           dbListar("afastamentos", afastamentoDoBanco),
           dbListar("reforcos", reforcoDoBanco),
           dbListar("configuracoes_lotacao", configLotacaoDoBanco),
           dbListar("substituicoes", substituicaoDoBanco),
+          dbListar("horarios_lotacao", horarioLotacaoDoBanco),
+          dbListar("horarios_excecao", horarioExcecaoDoBanco),
         ]);
         setPoliciais(pol);
         setEscalantes(esc.length > 0 ? esc : [{ usuario: "admin", senha: "admin123", nome: "Administrador" }]);
@@ -432,6 +490,8 @@ function App() {
         setReforcos(ref);
         setConfiguracoesLotacao(cfg);
         setSubstituicoes(sub);
+        setHorariosLotacao(horLot);
+        setHorariosExcecao(horExc);
       } catch (e) {
         setErroCarregar("Não foi possível conectar ao banco de dados. Verifique sua internet e tente novamente.");
       }
@@ -475,6 +535,22 @@ function App() {
     const ok = await dbSincronizar("substituicoes", novas, substituicaoParaBanco);
     if (!ok) setErroSalvar("Não foi possível salvar no banco de dados. Verifique sua internet.");
   }, []);
+  // Salva (upsert) o horário padrão de UMA lotação+dia da semana específico.
+  const salvarHorarioLotacao = useCallback(async (equipeId, diaSemana, dados) => {
+    const novos = [
+      ...horariosLotacao.filter((h) => !(h.equipeId === equipeId && h.diaSemana === diaSemana)),
+      { equipeId, diaSemana, ...dados },
+    ];
+    setHorariosLotacao(novos);
+    const { error } = await db.from("horarios_lotacao").upsert([horarioLotacaoParaBanco({ equipeId, diaSemana, ...dados })], { onConflict: "equipe_id,dia_semana" });
+    if (error) setErroSalvar("Não foi possível salvar o horário. Verifique sua internet.");
+  }, [horariosLotacao]);
+  const salvarHorariosExcecao = useCallback(async (novas, removidoId) => {
+    setHorariosExcecao(novas);
+    if (removidoId) await dbExcluir("horarios_excecao", "id", removidoId);
+    const ok = await dbSincronizar("horarios_excecao", novas, horarioExcecaoParaBanco);
+    if (!ok) setErroSalvar("Não foi possível salvar a exceção de horário. Verifique sua internet.");
+  }, []);
 
   if (carregando) {
     return (
@@ -496,7 +572,7 @@ function App() {
   }
 
   if (modoTela === "consultaRE") {
-    return <TelaConsultaRE policiais={policiais} afastamentos={afastamentos} reforcos={reforcos} configuracoesLotacao={configuracoesLotacao} substituicoes={substituicoes} onVoltar={() => setModoTela("login")} />;
+    return <TelaConsultaRE policiais={policiais} afastamentos={afastamentos} reforcos={reforcos} configuracoesLotacao={configuracoesLotacao} substituicoes={substituicoes} horariosLotacao={horariosLotacao} horariosExcecao={horariosExcecao} onVoltar={() => setModoTela("login")} />;
   }
 
   if (!usuarioLogado) {
@@ -530,6 +606,7 @@ function App() {
             afastamentos={afastamentos} reforcos={reforcos} salvarReforcos={salvarReforcos}
             configuracoesLotacao={configuracoesLotacao}
             substituicoes={substituicoes}
+            horariosLotacao={horariosLotacao} horariosExcecao={horariosExcecao} salvarHorariosExcecao={salvarHorariosExcecao}
             podeEditar={podeEditar}
             onAbrirConfig={() => setModalConfigAberto(true)}
             onAbrirConsolidada={() => setModalConsolidadaAberto(true)}
@@ -544,13 +621,17 @@ function App() {
         <ModalConfiguracaoLotacao
           configuracoesLotacao={configuracoesLotacao}
           salvarConfiguracaoLotacao={salvarConfiguracaoLotacao}
+          horariosLotacao={horariosLotacao}
+          salvarHorarioLotacao={salvarHorarioLotacao}
+          horariosExcecao={horariosExcecao}
+          salvarHorariosExcecao={salvarHorariosExcecao}
           onClose={() => setModalConfigAberto(false)}
         />
       )}
       {modalConsolidadaAberto && (
         <ModalVisaoConsolidada
           policiais={policiais} afastamentos={afastamentos} reforcos={reforcos} substituicoes={substituicoes}
-          configuracoesLotacao={configuracoesLotacao} dataRef={dataRef}
+          configuracoesLotacao={configuracoesLotacao} horariosLotacao={horariosLotacao} horariosExcecao={horariosExcecao} dataRef={dataRef}
           onClose={() => setModalConsolidadaAberto(false)}
         />
       )}
@@ -589,7 +670,7 @@ function TabButton({ ativo, onClick, Icon, label }) {
    TELA: ESCALA — GRADE
    ============================================================ */
 
-function TelaEscala({ policiais, equipeAtiva, setEquipeAtiva, dataRef, setDataRef, afastamentos, reforcos, salvarReforcos, configuracoesLotacao, substituicoes, podeEditar, onAbrirConfig, onAbrirConsolidada }) {
+function TelaEscala({ policiais, equipeAtiva, setEquipeAtiva, dataRef, setDataRef, afastamentos, reforcos, salvarReforcos, configuracoesLotacao, substituicoes, horariosLotacao, horariosExcecao, podeEditar, onAbrirConfig, onAbrirConsolidada }) {
   const [modalCelula, setModalCelula] = useState(null);
   const equipe = EQUIPES.find((e) => e.id === equipeAtiva);
   const membrosEquipe = useMemo(() => policiais.filter((p) => p.equipeId === equipeAtiva && p.ativo !== false).sort((a,b) => a.nomeGuerra.localeCompare(b.nomeGuerra)), [policiais, equipeAtiva]);
@@ -603,7 +684,7 @@ function TelaEscala({ policiais, equipeAtiva, setEquipeAtiva, dataRef, setDataRe
   };
 
   // Gera a escala automática deste mês/equipe em tempo real (sem precisar salvar nada).
-  const escalaBase = useMemo(() => gerarEscalaAutomatica(policiais, equipeAtiva, dataRef.ano, dataRef.mes, configuracoesLotacao), [policiais, equipeAtiva, dataRef, configuracoesLotacao]);
+  const escalaBase = useMemo(() => gerarEscalaAutomatica(policiais, equipeAtiva, dataRef.ano, dataRef.mes, configuracoesLotacao, horariosLotacao, horariosExcecao), [policiais, equipeAtiva, dataRef, configuracoesLotacao, horariosLotacao, horariosExcecao]);
 
   const dias = diasDoMes(dataRef.ano, dataRef.mes);
 
@@ -774,59 +855,211 @@ function ModalEdicaoCelula({ dataISO, policial, equipe, item, temReforco, temAfa
    MODAL: CONFIGURAÇÃO DA ESCALA (data-âncora por lotação)
    ============================================================ */
 
-function ModalConfiguracaoLotacao({ configuracoesLotacao, salvarConfiguracaoLotacao, onClose }) {
-  const lotacoes12x24 = EQUIPES.filter((e) => e.tipo === "12x24-12x48");
-  const [valores, setValores] = useState(() => {
-    const inicial = {};
-    lotacoes12x24.forEach((eq) => {
-      const config = configuracoesLotacao.find((c) => c.equipeId === eq.id);
-      inicial[eq.id] = config?.dataAncora || "";
-    });
-    return inicial;
+const DIAS_SEMANA_LABEL = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
+
+function ModalConfiguracaoLotacao({ configuracoesLotacao, salvarConfiguracaoLotacao, horariosLotacao, salvarHorarioLotacao, horariosExcecao, salvarHorariosExcecao, onClose }) {
+  const [equipeSelecionada, setEquipeSelecionada] = useState(EQUIPES[0].id);
+  const equipe = EQUIPES.find((e) => e.id === equipeSelecionada);
+  const usaTurnoDuplo = equipe.tipo === "12x24-12x48"; // DIA + NOITE. Demais (2x2/2x2-cgp): só 1 horário de serviço.
+  const [modalExcecaoAberto, setModalExcecaoAberto] = useState(false);
+
+  const [dataAncora, setDataAncora] = useState(() => {
+    const config = configuracoesLotacao.find((c) => c.equipeId === equipeSelecionada);
+    return config?.dataAncora || "";
   });
 
-  const salvarUma = (equipeId) => {
-    const dataAncora = valores[equipeId];
+  useEffect(() => {
+    const config = configuracoesLotacao.find((c) => c.equipeId === equipeSelecionada);
+    setDataAncora(config?.dataAncora || "");
+  }, [equipeSelecionada, configuracoesLotacao]);
+
+  const salvarAncora = () => {
     if (!dataAncora) { alert("Informe uma data-âncora válida."); return; }
-    salvarConfiguracaoLotacao(equipeId, dataAncora);
+    salvarConfiguracaoLotacao(equipeSelecionada, dataAncora);
+  };
+
+  const excecoesDaLotacao = useMemo(() => horariosExcecao.filter((h) => h.equipeId === equipeSelecionada).sort((a,b) => b.dataISO.localeCompare(a.dataISO)), [horariosExcecao, equipeSelecionada]);
+  const removerExcecao = (id) => { if (confirm("Remover esta exceção de horário?")) salvarHorariosExcecao(horariosExcecao.filter((h) => h.id !== id), id); };
+  const adicionarExcecao = (dados) => { salvarHorariosExcecao([...horariosExcecao, { ...dados, id: `he-${Date.now()}`, equipeId: equipeSelecionada }]); setModalExcecaoAberto(false); };
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={{ ...styles.modalCard, maxWidth: 620 }} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <div>
+            <div style={styles.modalTitle}>Configuração da escala</div>
+            <div style={styles.modalSubtitle}>Data-âncora e horários por lotação</div>
+          </div>
+          <button onClick={onClose} style={styles.modalClose}><IconX size={20} /></button>
+        </div>
+        <div style={{ ...styles.modalBody, maxHeight: "75vh", overflowY: "auto" }}>
+          <div style={styles.equipeSelector}>
+            {EQUIPES.map((eq) => (
+              <button key={eq.id} onClick={() => setEquipeSelecionada(eq.id)} style={{ ...styles.equipeChip, ...(equipeSelecionada === eq.id ? styles.equipeChipAtivo : {}) }}>{eq.nome}</button>
+            ))}
+          </div>
+
+          {usaTurnoDuplo && (
+            <div style={styles.configLotacaoBloco}>
+              <div style={styles.configLotacaoNome}>Data-âncora (rodízio das equipes A/B/C/D)</div>
+              <div style={styles.hint}>
+                Na data escolhida, a <strong>Equipe A</strong> está de turno <strong>DIA</strong> e a <strong>Equipe B</strong> de turno <strong>NOITE</strong> (C e D seguem automaticamente o rodízio de 4 dias).
+              </div>
+              <div style={styles.addExtraRowConfig}>
+                <input type="date" style={{ ...styles.input, marginTop: 0, flex: 1 }} value={dataAncora} onChange={(e) => setDataAncora(e.target.value)} />
+                <button onClick={salvarAncora} style={styles.btnSecondarySmall}><IconCheck size={14} /> Salvar</button>
+              </div>
+            </div>
+          )}
+
+          <div style={styles.configLotacaoBloco}>
+            <div style={styles.configLotacaoNome}>Horário padrão por dia da semana</div>
+            <div style={styles.hint}>
+              {usaTurnoDuplo
+                ? "Defina o horário do turno DIA e do turno NOITE para cada dia da semana. Pode variar dia a dia (ex: sexta e sábado diferentes dos demais)."
+                : "Defina o horário de serviço para cada dia da semana."}
+            </div>
+            {DIAS_SEMANA_LABEL.map((label, dow) => (
+              <LinhaHorarioDiaSemana
+                key={dow}
+                diaSemana={dow}
+                label={label}
+                equipeId={equipeSelecionada}
+                usaTurnoDuplo={usaTurnoDuplo}
+                horarioAtual={horariosLotacao.find((h) => h.equipeId === equipeSelecionada && h.diaSemana === dow)}
+                onSalvar={(dados) => salvarHorarioLotacao(equipeSelecionada, dow, dados)}
+              />
+            ))}
+          </div>
+
+          <div style={{ ...styles.configLotacaoBloco, borderBottom: "none" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={styles.configLotacaoNome}>Exceções pontuais</div>
+              <button onClick={() => setModalExcecaoAberto(true)} style={styles.btnSecondarySmall}><IconPlus size={14} /> Nova exceção</button>
+            </div>
+            <div style={styles.hint}>Sobrescreve o horário padrão num dia específico (ex: operação especial).</div>
+            {excecoesDaLotacao.length === 0 && <div style={{ ...styles.hint, color: "#94a3b8" }}>Nenhuma exceção lançada para esta lotação.</div>}
+            {excecoesDaLotacao.map((h) => (
+              <div key={h.id} style={styles.linhaHorarioDia}>
+                <span style={styles.linhaHorarioDiaLabel}>{formatarDataBR(h.dataISO)}</span>
+                <span style={styles.linhaHorarioDiaValor}>
+                  {usaTurnoDuplo ? `DIA ${h.horaInicioDia}-${h.horaFimDia} · NOITE ${h.horaInicioNoite || "—"}-${h.horaFimNoite || "—"}` : `${h.horaInicioDia}-${h.horaFimDia}`}
+                </span>
+                <button onClick={() => removerExcecao(h.id)} style={styles.iconBtnDanger}><IconTrash size={14} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={styles.modalFooter}><button onClick={onClose} style={styles.btnTextoCancelar}>Fechar</button></div>
+      </div>
+      {modalExcecaoAberto && (
+        <ModalExcecaoHorario usaTurnoDuplo={usaTurnoDuplo} onClose={() => setModalExcecaoAberto(false)} onSalvar={adicionarExcecao} />
+      )}
+    </div>
+  );
+}
+
+function ModalExcecaoHorario({ usaTurnoDuplo, onClose, onSalvar }) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const [form, setForm] = useState({ dataISO: hoje, horaInicioDia: "", horaFimDia: "", horaInicioNoite: "", horaFimNoite: "" });
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!form.horaInicioDia || !form.horaFimDia) { alert("Informe ao menos o horário de início e fim."); return; }
+    onSalvar(form);
   };
 
   return (
     <div style={styles.modalOverlay} onClick={onClose}>
-      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
-        <div style={styles.modalHeader}>
-          <div>
-            <div style={styles.modalTitle}>Configuração da escala</div>
-            <div style={styles.modalSubtitle}>Data-âncora por lotação (regime 12x24/12x48)</div>
+      <div style={{ ...styles.modalCard, maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}><div style={styles.modalTitle}>Nova exceção de horário</div><button onClick={onClose} style={styles.modalClose}><IconX size={20} /></button></div>
+        <form onSubmit={submit} style={styles.modalBody}>
+          <label style={styles.label}>Data</label>
+          <input type="date" style={styles.input} value={form.dataISO} onChange={(e) => setForm({ ...form, dataISO: e.target.value })} />
+
+          <label style={styles.label}>{usaTurnoDuplo ? "Horário DIA" : "Horário de serviço"}</label>
+          <div style={styles.horarioCamposRow}>
+            <input type="time" style={styles.inputHorario} value={form.horaInicioDia} onChange={(e) => setForm({ ...form, horaInicioDia: e.target.value })} />
+            <span>às</span>
+            <input type="time" style={styles.inputHorario} value={form.horaFimDia} onChange={(e) => setForm({ ...form, horaFimDia: e.target.value })} />
           </div>
-          <button onClick={onClose} style={styles.modalClose}><IconX size={20} /></button>
-        </div>
-        <div style={styles.modalBody}>
-          <div style={styles.hint}>
-            A data-âncora define em qual dia a <strong>Equipe A</strong> está de turno <strong>DIA</strong> e a <strong>Equipe B</strong> de turno <strong>NOITE</strong> (as equipes C e D seguem automaticamente o rodízio de 4 dias).
-            Cada lotação tem sua própria data, de forma independente.
-          </div>
-          {lotacoes12x24.map((eq) => {
-            const configAtual = configuracoesLotacao.find((c) => c.equipeId === eq.id);
-            return (
-              <div key={eq.id} style={styles.configLotacaoBloco}>
-                <div style={styles.configLotacaoNome}>{eq.nome}</div>
-                <div style={styles.addExtraRowConfig}>
-                  <input
-                    type="date"
-                    style={{ ...styles.input, marginTop: 0, flex: 1 }}
-                    value={valores[eq.id]}
-                    onChange={(e) => setValores({ ...valores, [eq.id]: e.target.value })}
-                  />
-                  <button onClick={() => salvarUma(eq.id)} style={styles.btnSecondarySmall}><IconCheck size={14} /> Salvar</button>
-                </div>
-                {configAtual && <div style={styles.hint}>Configurado: A=DIA, B=NOITE em {formatarDataBR(configAtual.dataAncora)}.</div>}
-                {!configAtual && <div style={{ ...styles.hint, color: "#92400e" }}>Ainda não configurado.</div>}
+
+          {usaTurnoDuplo && (
+            <>
+              <label style={styles.label}>Horário NOITE</label>
+              <div style={styles.horarioCamposRow}>
+                <input type="time" style={styles.inputHorario} value={form.horaInicioNoite} onChange={(e) => setForm({ ...form, horaInicioNoite: e.target.value })} />
+                <span>às</span>
+                <input type="time" style={styles.inputHorario} value={form.horaFimNoite} onChange={(e) => setForm({ ...form, horaFimNoite: e.target.value })} />
               </div>
-            );
-          })}
+            </>
+          )}
+
+          <div style={styles.modalFooter}><button type="button" onClick={onClose} style={styles.btnTextoCancelar}>Cancelar</button><button type="submit" style={styles.btnPrimary}><IconCheck size={16} /> Salvar</button></div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function LinhaHorarioDiaSemana({ label, usaTurnoDuplo, horarioAtual, onSalvar }) {
+  const [editando, setEditando] = useState(false);
+  const [form, setForm] = useState({
+    horaInicioDia: horarioAtual?.horaInicioDia || "",
+    horaFimDia: horarioAtual?.horaFimDia || "",
+    horaInicioNoite: horarioAtual?.horaInicioNoite || "",
+    horaFimNoite: horarioAtual?.horaFimNoite || "",
+  });
+
+  useEffect(() => {
+    setForm({
+      horaInicioDia: horarioAtual?.horaInicioDia || "",
+      horaFimDia: horarioAtual?.horaFimDia || "",
+      horaInicioNoite: horarioAtual?.horaInicioNoite || "",
+      horaFimNoite: horarioAtual?.horaFimNoite || "",
+    });
+  }, [horarioAtual]);
+
+  const salvar = () => {
+    if (!form.horaInicioDia || !form.horaFimDia) { alert("Informe ao menos o horário de início e fim."); return; }
+    onSalvar(form);
+    setEditando(false);
+  };
+
+  if (!editando) {
+    return (
+      <div style={styles.linhaHorarioDia}>
+        <span style={styles.linhaHorarioDiaLabel}>{label}</span>
+        <span style={styles.linhaHorarioDiaValor}>
+          {horarioAtual
+            ? (usaTurnoDuplo ? `DIA ${horarioAtual.horaInicioDia}-${horarioAtual.horaFimDia} · NOITE ${horarioAtual.horaInicioNoite || "—"}-${horarioAtual.horaFimNoite || "—"}` : `${horarioAtual.horaInicioDia}-${horarioAtual.horaFimDia}`)
+            : <span style={{ color: "#94a3b8" }}>Não configurado</span>}
+        </span>
+        <button onClick={() => setEditando(true)} style={styles.btnTextoSmall}>Editar</button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.linhaHorarioDiaEdicao}>
+      <div style={styles.linhaHorarioDiaLabel}>{label}</div>
+      <div style={styles.horarioCamposRow}>
+        <span style={styles.horarioCamposLabel}>{usaTurnoDuplo ? "DIA" : "Serviço"}</span>
+        <input type="time" style={styles.inputHorario} value={form.horaInicioDia} onChange={(e) => setForm({ ...form, horaInicioDia: e.target.value })} />
+        <span>às</span>
+        <input type="time" style={styles.inputHorario} value={form.horaFimDia} onChange={(e) => setForm({ ...form, horaFimDia: e.target.value })} />
+      </div>
+      {usaTurnoDuplo && (
+        <div style={styles.horarioCamposRow}>
+          <span style={styles.horarioCamposLabel}>NOITE</span>
+          <input type="time" style={styles.inputHorario} value={form.horaInicioNoite} onChange={(e) => setForm({ ...form, horaInicioNoite: e.target.value })} />
+          <span>às</span>
+          <input type="time" style={styles.inputHorario} value={form.horaFimNoite} onChange={(e) => setForm({ ...form, horaFimNoite: e.target.value })} />
         </div>
-        <div style={styles.modalFooter}><button onClick={onClose} style={styles.btnTextoCancelar}>Fechar</button></div>
+      )}
+      <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+        <button onClick={() => setEditando(false)} style={styles.btnTextoCancelar}>Cancelar</button>
+        <button onClick={salvar} style={styles.btnSecondarySmall}><IconCheck size={14} /> Salvar</button>
       </div>
     </div>
   );
@@ -836,7 +1069,7 @@ function ModalConfiguracaoLotacao({ configuracoesLotacao, salvarConfiguracaoLota
    MODAL: VISÃO CONSOLIDADA (todas as lotações juntas)
    ============================================================ */
 
-function ModalVisaoConsolidada({ policiais, afastamentos, reforcos, substituicoes, configuracoesLotacao, dataRef, onClose }) {
+function ModalVisaoConsolidada({ policiais, afastamentos, reforcos, substituicoes, configuracoesLotacao, horariosLotacao, horariosExcecao, dataRef, onClose }) {
   const dias = diasDoMes(dataRef.ano, dataRef.mes);
 
   return (
@@ -853,7 +1086,7 @@ function ModalVisaoConsolidada({ policiais, afastamentos, reforcos, substituicoe
           {EQUIPES.map((equipe) => {
             const membros = policiais.filter((p) => p.equipeId === equipe.id && p.ativo !== false).sort((a,b) => a.nomeGuerra.localeCompare(b.nomeGuerra));
             if (membros.length === 0) return null;
-            const escalaBase = gerarEscalaAutomatica(policiais, equipe.id, dataRef.ano, dataRef.mes, configuracoesLotacao);
+            const escalaBase = gerarEscalaAutomatica(policiais, equipe.id, dataRef.ano, dataRef.mes, configuracoesLotacao, horariosLotacao, horariosExcecao);
             const statusFinal = (iso, policialId) => {
               const substituicao = substituicoes.find((s) => s.titularId === policialId && s.dataISO === iso);
               if (substituicao) {
@@ -1354,6 +1587,13 @@ const styles = {
   configLotacaoBloco: { padding:"14px 0", borderBottom:`1px solid ${COLORS.border}` },
   configLotacaoNome: { fontSize:14, fontWeight:700, color:COLORS.text, marginBottom:8 },
   addExtraRowConfig: { display:"flex", gap:8, alignItems:"center" },
+  linhaHorarioDia: { display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, padding:"9px 0", borderBottom:`1px solid #f1f4f8` },
+  linhaHorarioDiaLabel: { fontSize:13, fontWeight:600, color:COLORS.text, minWidth:80 },
+  linhaHorarioDiaValor: { fontSize:12.5, color:COLORS.textMuted, flex:1 },
+  linhaHorarioDiaEdicao: { padding:"10px 0", borderBottom:`1px solid #f1f4f8` },
+  horarioCamposRow: { display:"flex", alignItems:"center", gap:8, marginTop:6, fontSize:13, color:COLORS.textMuted },
+  horarioCamposLabel: { fontSize:11.5, fontWeight:700, color:COLORS.navy, minWidth:48 },
+  inputHorario: { padding:"6px 8px", borderRadius:6, border:`1px solid ${COLORS.border}`, fontSize:13 },
   consultaResultadoHeader: { display:"flex", alignItems:"center", gap:10, padding:"10px 12px", background:"#f8fafc", borderRadius:8, marginBottom:14 },
   consultaLista: { maxHeight:360, overflowY:"auto", display:"flex", flexDirection:"column", gap:4 },
   consultaLinha: { display:"flex", justifyContent:"space-between", fontSize:12.5, padding:"6px 10px", borderRadius:6, background:"#f8fafc" },
